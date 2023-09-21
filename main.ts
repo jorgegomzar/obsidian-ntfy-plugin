@@ -1,4 +1,4 @@
-import { App, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
 
 interface NTFYPluginSettings {
 	ntfy_server_url: string;
@@ -6,6 +6,17 @@ interface NTFYPluginSettings {
 	warned_user: boolean;
 }
 
+interface NTFYMessage {
+	title: string;
+	body: string;
+	attachment: string;
+}
+
+const DEFAULT_EMPTY_MESSAGE: NTFYMessage = {
+	title: '',
+	body: '',
+	attachment: '',
+}
 const DEFAULT_SETTINGS: NTFYPluginSettings = {
 	ntfy_server_url: 'https://ntfy.sh',
 	ntfy_topic: 'obsidian-ntfy',
@@ -22,18 +33,40 @@ export default class NTFYPlugin extends Plugin {
 		this.addRibbonIcon(
 			'megaphone',
 			'Obsidian NTFY Plugin',
-			async (evt: MouseEvent) => {
-				await this.loadSettings();
-				new NTFYModal(this).open();
+			(evt: MouseEvent) => {
+				new NTFYModal(this.app, (ntfyMessage) => this.sendMessage(ntfyMessage)).open();
 		});
 
 		// Command
 		this.addCommand({
-			id: 'open-ntfy-modal-simple',
+			id: 'open-ntfy-modal-send-message',
 			name: 'Send message to queue',
+			callback: () => {
+				new NTFYModal(this.app, (ntfyMessage) => this.sendMessage(ntfyMessage)).open();
+			}
+		});
+
+		// Command
+		this.addCommand({
+			id: 'open-ntfy-modal-send-note',
+			name: 'Send current note to queue',
 			callback: async () => {
-				await this.loadSettings();
-				new NTFYModal(this).open();
+				// Currently Open Note
+				const noteFile = this.app.workspace.getActiveFile();
+
+				// Nothing Open
+				if(!noteFile || !noteFile.name) {
+					new Notice('No file selected');
+					return;
+				}
+
+				const fileMessage = {
+					title: noteFile.basename,
+					body: await this.app.vault.read(noteFile),
+				}
+
+				let ntfyMessage = Object.assign({}, DEFAULT_EMPTY_MESSAGE, fileMessage)
+				this.sendMessage(ntfyMessage)
 			}
 		});
 
@@ -49,67 +82,81 @@ export default class NTFYPlugin extends Plugin {
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 
-		// We want to make sure the url is well formed
-		if (this.settings.ntfy_server_url[-1] != '\/')
-			this.settings.ntfy_server_url += '\/'
-
+		// Let's warn the user the first time they enable the plugin
 		if (!this.settings.warned_user)
 			this.settings.warned_user = true
-			new Notice('Please check your NTFY settings. Using default values.');
+			new Notice('Please check your NTFY settings');
+			await this.saveSettings()
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
+
+	// This method will be passed to other components as a lambda
+	async sendMessage(ntfyMessage: NTFYMessage) {
+		fetch(this.settings.ntfy_server_url + this.settings.ntfy_topic, {
+			method: 'POST',
+			body: ntfyMessage.body,
+			headers: {
+				'Title': ntfyMessage.title,
+				'Tags': "crystal_ball",
+			}
+		})
+
+		new Notice('Sending message to ++' + this.settings.ntfy_topic + '++ topic...');
+	}
 }
 
 class NTFYModal extends Modal {
-	settings: NTFYPluginSettings
-	message: string
+	ntfyMessage: NTFYMessage
+	// this method will be injected as a lambda by the plugin class
+	sendMessage: (ntfyMessage: NTFYMessage) => void;
 
-	constructor(plugin: NTFYPlugin) {
-		super(plugin.app);
-		this.settings = plugin.settings
+	constructor(app: App, sendMessage: (ntfyMessage: NTFYMessage) => void) {
+		super(app);
+		this.sendMessage = sendMessage
 	}
 
 	onOpen() {
-		const {contentEl} = this;
-		contentEl.createEl('h1', { text: 'Obsidian NTFY: Send message to queue' })
+		this.ntfyMessage = Object.assign({}, DEFAULT_EMPTY_MESSAGE)
 
+		const {contentEl} = this;
+		contentEl.createEl('h3', { text: 'Obsidian NTFY: Send message to queue' })
+
+		new Setting(contentEl)
+			.setName('Message title')
+			.addText((text) =>
+				text.onChange((value) => {
+					this.ntfyMessage.title = value
+				})
+			)
+
+		// Message textbox
 		new Setting(contentEl)
 			.setName('Message content')
 			.addText((text) =>
 				text.onChange((value) => {
-					this.message = value
+					this.ntfyMessage.body = value
 				})
 			)
 		
+		// Submit btn
 		new Setting(contentEl)
 			.addButton((btn) => 
 				btn
 				.setButtonText('Send')
 				.setCta()
-				.onClick(() => {
-					this.onSubmit(this.message)
+				.onClick(async () => {
+					this.sendMessage(this.ntfyMessage);
 					this.close();
 				})
-			)
-
+			)		
 	}
 
 	onClose() {
 		const {contentEl} = this;
 		contentEl.empty();
-		this.message = ''
-	}
-
-	onSubmit(message: string) {
-		fetch(this.settings.ntfy_server_url + this.settings.ntfy_topic, {
-			method: 'POST',
-			body: message,
-		})
-
-		new Notice('Sending message to ' + this.settings.ntfy_topic + ' topic...');
 	}
 }
 
@@ -126,10 +173,10 @@ class NTFYSettingTab extends PluginSettingTab {
 
 		containerEl.empty();
 
-		this._add_configurations(containerEl)
+		this._add_settings(containerEl)
 
 	}
-	_add_configurations(containerEl: HTMLElement) {
+	_add_settings(containerEl: HTMLElement) {
 		// NTFY SERVER URL
 		new Setting(containerEl)
 		.setName('NTFY Server URL')
@@ -141,6 +188,11 @@ class NTFYSettingTab extends PluginSettingTab {
 			.onChange(async (value) => {
 				if (!value)
 					value = DEFAULT_SETTINGS.ntfy_server_url
+
+				// We want to make sure the url is well formed
+				if (value.substring(value.length - 1) != '/')
+					value += '/'
+				
 				this.plugin.settings.ntfy_server_url = value;
 				await this.plugin.saveSettings();
 			})
